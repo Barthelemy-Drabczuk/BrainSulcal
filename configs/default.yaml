@@ -1,0 +1,42 @@
+model:
+  sulcal_aggregator:
+    hidden_dim: 256
+    n_heads: 4
+    n_layers: 2
+    dropout: 0.1
+  moe_router_bias:
+    hidden_dim: 128
+    init_std: 1.0e-3      # Critical: near-zero init to preserve BrainOmni routing
+  prefix_proj_dim: 512    # Must match BrainOmni d_model exactly
+
+training:
+  batch_size: 8
+  max_epochs: 50
+  early_stopping_patience: 10
+  gradient_clip: 1.0
+  lambda_align: 0.1
+
+  optimizer: AdamW
+  scheduler: cosine_with_warmup
+  warmup_steps: 100
+
+  # Differential learning rates per component
+  lr_sulcal_aggregator: 1.0e-4
+  lr_moe_router_bias: 5.0e-5    # Slower: surgical BrainOmni intervention
+  lr_classification_head: 1.0e-3
+  weight_decay: 1.0e-4
+
+evaluation:
+  protocol: leave_one_subject_out
+  metrics: [accuracy, f1_macro, auroc]
+
+data:
+  champollion_embeddings_dir: data/processed/champollion
+  daly_raw_dir: data/raw/daly_music
+  musin_g_raw_dir: data/raw/musin_g
+  cache_dir: data/processed/cache
+
+logging:
+  wandb_project: brainsulcal
+  log_router_bias_entropy: true
+  log_sulcal_attn_weights: true

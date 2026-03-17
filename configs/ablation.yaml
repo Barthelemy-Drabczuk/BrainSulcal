@@ -1,0 +1,23 @@
+# @package _global_
+defaults:
+  - daly_music
+
+# Four ablation conditions
+ablation:
+  conditions:
+    brainomni_only:
+      use_sulcal_prior: false
+      use_router_bias: false
+      use_prefix_token: false
+    prefix_only:
+      use_sulcal_prior: true
+      use_router_bias: false
+      use_prefix_token: true
+    router_only:
+      use_sulcal_prior: true
+      use_router_bias: true
+      use_prefix_token: false
+    full_brainsulcal:
+      use_sulcal_prior: true
+      use_router_bias: true
+      use_prefix_token: true

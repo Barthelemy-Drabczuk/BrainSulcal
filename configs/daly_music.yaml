@@ -1,0 +1,20 @@
+# @package _global_
+defaults:
+  - default
+
+data:
+  dataset: daly_music
+  openneuro_id: ds002725
+  n_subjects_eeg_fmri: 21
+  n_subjects_eeg_only: 114
+  eeg_channels: 31
+  original_sfreq: 5000
+  target_sfreq: 250
+  bandpass_low: 1.0
+  bandpass_high: 40.0
+  epoch_reject_threshold_uv: 150.0
+  label_binarize: median_split_per_subject
+  tasks: [valence, arousal]
+
+model:
+  n_classes: 2  # binary per task

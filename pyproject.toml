@@ -1,0 +1,9 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "brainsulcal"
+version = "0.1.0"
+requires-python = ">=3.10"
+# All actual dependencies live in pixi.toml — do not add them here

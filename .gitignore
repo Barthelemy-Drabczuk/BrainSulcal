@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Pixi
+.pixi/
+
+# Data (never commit raw or processed data)
+data/raw/
+data/processed/
+
+# Experiment runs (checkpoints, results, figures)
+runs/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# IDEs
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+
+# wandb
+wandb/
+
+# Coverage
+htmlcov/
+.coverage
+
+# Project instructions (not for version control)
+CLAUDE.md
+
+# OMC state
+.omc/
