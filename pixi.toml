@@ -1,4 +1,4 @@
-[project]
+[workspace]
 name = "brainsulcal"
 version = "0.1.0"
 description = "Champollion-conditioned BrainOmni for music brain response decoding"
@@ -36,10 +36,9 @@ typecheck = "mypy brainsulcal/"
 [dependencies]
 python = ">=3.10,<3.12"
 
-# PyTorch
+# PyTorch (CPU build — use [feature.gpu] on CEA cluster)
 pytorch = ">=2.1.0"
 torchvision = "*"
-pytorch-cuda = "12.1.*"
 
 # Scientific stack
 numpy = ">=1.24"
@@ -77,6 +76,12 @@ mypy       = ">=1.0"
 [feature.dev.tasks]
 test = "pytest tests/ -v"
 
+# GPU feature: activate on CEA cluster with `pixi install --environment gpu`
+# pytorch-cuda version must match the cluster's driver — check with `nvidia-smi`
+[feature.gpu.dependencies]
+pytorch-cuda = ">=12.1,<12.5"
+
 [environments]
 default = { features = [], solve-group = "default" }
 dev     = { features = ["dev"], solve-group = "default" }
+gpu     = { features = ["gpu"], solve-group = "gpu" }   # solved independently

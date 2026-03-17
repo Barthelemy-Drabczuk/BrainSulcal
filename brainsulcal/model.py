@@ -1,18 +1,31 @@
-"""BrainSulcal: top-level model combining Champollion and BrainOmni.
+"""BrainSulcal: Champollion-conditioned BrainOmni for EEG classification.
 
-Three injection points for the sulcal prior:
-  1. MoE router bias: z_sulcal → MoERouterBias → added to BrainOmni router logits
-  2. Prefix token:    z_sulcal projected and prepended to BrainOmni token sequence
-  3. Downstream head: z_sulcal concatenated with pooled BrainOmni output
+Architecture (after studying BrainOmni source — no MoE router exists):
+
+BrainOmni uses SpatialTemporalAttentionBlock:
+  - Spatial attention over channels (B*W, C, D//2)
+  - Temporal attention over windows (B*C, W, D//2)
+  - encode() returns (B, C, W, lm_dim) L2-normalized
+
+Three sulcal injection points:
+  1. Channel embedding bias: z_sulcal → (B,1,1,n_dim) added to neuro embeddings
+     (surgical injection at BrainOmni's internal neuro positional embeddings)
+  2. Prefix virtual channel: z_sulcal projected as extra channel appended to
+     window-pooled features before the classification head
+  3. Downstream fusion: z_sulcal concatenated with mean-pooled z_eeg
 
 Trainable components only:
   - SulcalAggregator
-  - MoERouterBias
-  - PrefixFusion projection
-  - Fusion MLP
-  - Classification head
+  - MoERouterBias (outputs channel embedding bias)
+  - Prefix projection (z_sulcal → lm_dim virtual channel)
+  - Fusion MLP + classification head
 
 BrainOmni and Champollion are always frozen.
+
+Input format (matching BrainOmni API):
+  eeg:          (B, C, W*T)  — windowed EEG (C channels, W windows × T samples)
+  pos:          (B, C, 6)    — electrode xyz + orientation (6D)
+  sensor_type:  (B, C)       — sensor type integer codes
 """
 
 from __future__ import annotations
@@ -24,38 +37,37 @@ import torch.nn as nn
 
 from brainsulcal.dynamics.brainomni_wrapper import BrainOmniWrapper
 from brainsulcal.dynamics.moe_router_bias import MoERouterBias
-from brainsulcal.fusion.prefix_fusion import PrefixFusion
 from brainsulcal.priors.sulcal_aggregator import SulcalAggregator
 
 
 @dataclass
 class BrainSulcalConfig:
     # SulcalAggregator
-    champollion_input_dim: int = 128       # Set from wrapper.embedding_dim at runtime
+    champollion_input_dim: int = 128       # Set from ChampollionWrapper.embedding_dim
     sulcal_hidden_dim: int = 256
     sulcal_n_heads: int = 4
     sulcal_n_layers: int = 2
     sulcal_dropout: float = 0.1
 
-    # MoERouterBias
-    n_experts: int | None = None           # Must match BrainOmni; set after loading model
+    # MoERouterBias (channel embedding bias)
+    n_dim: int = 256                       # BrainOmni tokenizer n_dim (before projection)
     router_bias_hidden_dim: int = 128
     router_bias_init_std: float = 1e-3
 
     # BrainOmni
     brainomni_checkpoint: str = "OpenTSLab/BrainOmni"
-    d_model: int = 512                     # BrainOmni hidden dim; verify against source
+    lm_dim: int = 512                      # BrainOmni backbone hidden dim (after projection)
 
     # Fusion
-    use_router_bias: bool = True
-    use_prefix_token: bool = True
+    use_router_bias: bool = True           # Channel embedding bias injection
+    use_prefix_token: bool = True          # Prepend z_sulcal as virtual channel
     fusion_hidden_dim: int = 256
 
     # Task head
     n_classes: int = 2
     n_tasks: int = 2                       # valence + arousal
 
-    # Ablation flags (set via configs/ablation.yaml)
+    # Ablation flags
     use_sulcal_prior: bool = True
 
 
@@ -70,7 +82,7 @@ class BrainSulcal(nn.Module):
         super().__init__()
         self.config = config
 
-        # --- Frozen components ---
+        # --- Frozen backbone ---
         self.brainomni = BrainOmniWrapper(
             checkpoint=config.brainomni_checkpoint,
             freeze=True,
@@ -87,35 +99,27 @@ class BrainSulcal(nn.Module):
             )
 
             if config.use_router_bias:
-                if config.n_experts is None:
-                    raise ValueError(
-                        "config.n_experts must be set to match BrainOmni's MoE n_experts. "
-                        "Read BrainOmni source before instantiating BrainSulcal."
-                    )
-                self.moe_router_bias = MoERouterBias(
+                self.channel_bias = MoERouterBias(
                     sulcal_dim=config.sulcal_hidden_dim,
-                    n_experts=config.n_experts,
+                    n_dim=config.n_dim,
                     hidden_dim=config.router_bias_hidden_dim,
                     init_std=config.router_bias_init_std,
                 )
             else:
-                self.moe_router_bias = None
+                self.channel_bias = None
 
             if config.use_prefix_token:
-                self.prefix_fusion = PrefixFusion(
-                    sulcal_dim=config.sulcal_hidden_dim,
-                    d_model=config.d_model,
-                )
+                # Project z_sulcal as a virtual channel in BrainOmni's feature space
+                self.prefix_proj = nn.Linear(config.sulcal_hidden_dim, config.lm_dim)
             else:
-                self.prefix_fusion = None
+                self.prefix_proj = None
 
-            # Fusion: [z_sulcal ; z_eeg_pooled] → d_fused
-            fusion_input_dim = config.sulcal_hidden_dim + config.d_model
+            fusion_input_dim = config.sulcal_hidden_dim + config.lm_dim
         else:
             self.sulcal_aggregator = None
-            self.moe_router_bias = None
-            self.prefix_fusion = None
-            fusion_input_dim = config.d_model
+            self.channel_bias = None
+            self.prefix_proj = None
+            fusion_input_dim = config.lm_dim
 
         self.fusion_mlp = nn.Sequential(
             nn.Linear(fusion_input_dim, config.fusion_hidden_dim),
@@ -132,68 +136,77 @@ class BrainSulcal(nn.Module):
         self._verify_invariants()
 
     def _verify_invariants(self) -> None:
-        """Assert frozen/trainable split is correct."""
         assert not any(p.requires_grad for p in self.brainomni.parameters()), \
             "BrainOmni parameters must be frozen."
 
     def forward(
         self,
         eeg: torch.Tensor,
-        montage_info: dict,
+        pos: torch.Tensor,
+        sensor_type: torch.Tensor,
         sulcal_embeddings: torch.Tensor,
         sulcal_mask: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
         """Forward pass.
 
         Args:
-            eeg:               (B, C, T) raw EEG signal
-            montage_info:      dict with electrode positions / types
+            eeg:               (B, C, W*T) windowed EEG (W windows × T samples)
+            pos:               (B, C, 6) electrode positions
+            sensor_type:       (B, C) sensor type codes
             sulcal_embeddings: (B, 56, d_champollion) pre-computed embeddings
-            sulcal_mask:       (B, 56) bool — True where embedding is valid
+            sulcal_mask:       (B, 56) bool — True where valid
 
-        Returns dict with keys:
+        Returns dict:
             logits_valence: (B, n_classes)
             logits_arousal: (B, n_classes)
             z_sulcal:       (B, sulcal_hidden_dim) or None
-            z_eeg:          (B, d_model)
+            z_eeg:          (B, lm_dim)
             z_fused:        (B, fusion_hidden_dim)
         """
+        B = eeg.shape[0]
+
         # 1. Sulcal prior
         z_sulcal: torch.Tensor | None = None
-        router_bias: torch.Tensor | None = None
+        channel_bias: torch.Tensor | None = None
 
         if self.config.use_sulcal_prior and self.sulcal_aggregator is not None:
             z_sulcal, _ = self.sulcal_aggregator(sulcal_embeddings, sulcal_mask)
+            # z_sulcal: (B, sulcal_hidden_dim)
 
-            if self.moe_router_bias is not None:
-                router_bias = self.moe_router_bias(z_sulcal)
+            if self.channel_bias is not None:
+                channel_bias = self.channel_bias(z_sulcal)
+                # channel_bias: (B, 1, 1, n_dim) — injected into BrainOmni neuro embeddings
 
-        # 2. BrainOmni forward (frozen) with optional router bias
-        token_repr = self.brainomni(eeg, montage_info, router_bias=router_bias)
-        # token_repr: (B, n_tokens, d_model)
+        # 2. BrainOmni encode (frozen) with optional channel embedding bias
+        feat = self.brainomni.encode(
+            eeg, pos, sensor_type, channel_bias=channel_bias
+        )
+        # feat: (B, C, W, lm_dim)
 
-        # 3. Optional prefix token insertion (informational — used by downstream pooling)
-        if self.prefix_fusion is not None and z_sulcal is not None:
-            token_repr = self.prefix_fusion(z_sulcal, token_repr)
-            # token_repr: (B, n_tokens+1, d_model) — prefix is first token
+        # 3. Pool over windows → (B, C, lm_dim)
+        feat = feat.mean(dim=2)
 
-        # 4. Pool token representations → z_eeg
-        z_eeg = token_repr.mean(dim=1)  # (B, d_model)
+        # 4. Optional: prepend z_sulcal as virtual channel before mean-pooling channels
+        if self.prefix_proj is not None and z_sulcal is not None:
+            sulcal_channel = self.prefix_proj(z_sulcal).unsqueeze(1)  # (B, 1, lm_dim)
+            feat = torch.cat([sulcal_channel, feat], dim=1)           # (B, C+1, lm_dim)
 
-        # 5. Fuse sulcal + EEG representations
+        # 5. Mean-pool over channels → z_eeg
+        z_eeg = feat.mean(dim=1)  # (B, lm_dim)
+
+        # 6. Fuse sulcal + EEG
         if z_sulcal is not None:
-            z_fused_input = torch.cat([z_sulcal, z_eeg], dim=-1)
+            z_fused_input = torch.cat([z_sulcal, z_eeg], dim=-1)  # (B, sulcal_dim+lm_dim)
         else:
             z_fused_input = z_eeg
 
         z_fused = self.fusion_mlp(z_fused_input)  # (B, fusion_hidden_dim)
 
-        # 6. Task-specific heads
+        # 7. Task heads
         logits = [head(z_fused) for head in self.task_heads]
 
-        # Validate output shapes
-        B = eeg.shape[0]
-        assert z_eeg.shape == (B, self.config.d_model)
+        # Shape assertions
+        assert z_eeg.shape == (B, self.config.lm_dim)
         assert z_fused.shape == (B, self.config.fusion_hidden_dim)
         if z_sulcal is not None:
             assert z_sulcal.shape == (B, self.config.sulcal_hidden_dim)
@@ -207,31 +220,28 @@ class BrainSulcal(nn.Module):
         }
 
     def trainable_parameters(self) -> list[dict]:
-        """Return parameter groups with differential learning rates.
-
-        Use with configs/default.yaml lr values.
-        """
+        """Parameter groups with differential learning rates."""
         groups = []
-
         if self.sulcal_aggregator is not None:
             groups.append({
                 "params": list(self.sulcal_aggregator.parameters()),
                 "name": "sulcal_aggregator",
             })
-        if self.moe_router_bias is not None:
+        if self.channel_bias is not None:
             groups.append({
-                "params": list(self.moe_router_bias.parameters()),
-                "name": "moe_router_bias",
+                "params": list(self.channel_bias.parameters()),
+                "name": "moe_router_bias",  # keep name for config compatibility
             })
-        if self.prefix_fusion is not None:
+        if self.prefix_proj is not None:
             groups.append({
-                "params": list(self.prefix_fusion.parameters()),
+                "params": list(self.prefix_proj.parameters()),
                 "name": "prefix_fusion",
             })
-
         groups.append({
-            "params": list(self.fusion_mlp.parameters()) + list(self.task_heads.parameters()),
+            "params": (
+                list(self.fusion_mlp.parameters())
+                + list(self.task_heads.parameters())
+            ),
             "name": "classification_head",
         })
-
         return groups

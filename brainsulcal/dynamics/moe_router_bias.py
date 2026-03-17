@@ -1,10 +1,21 @@
-"""MoE Router Bias: maps z_sulcal to a bias over BrainOmni's expert vocabulary.
+"""Sulcal channel bias: maps z_sulcal → per-channel token embedding bias.
 
-The bias is added to MoE router logits BEFORE softmax, nudging expert selection
-toward anatomy-relevant experts without altering BrainOmni's weights.
+Original design assumed BrainOmni had a Sparse MoE router (per CLAUDE.md).
+After studying source (external/BrainOmni/brainomni/model.py), BrainOmni
+uses SpatialTemporalAttentionBlock — no MoE router exists.
 
-Critical: final layer initialized with near-zero weights (std=1e-3) so training
-starts with essentially zero router bias, preserving BrainOmni's pre-trained routing.
+The closest structural analog is the `neuro` per-channel positional embedding:
+    x = token_embeddings + neuro_emb          (BrainOmni vanilla)
+    x = token_embeddings + neuro_emb + bias   (BrainSulcal injection)
+
+This class maps z_sulcal → channel_bias (B, 1, 1, n_dim), which is then
+broadcast over all C channels and W windows. A subject with deeper Heschl's
+gyrus gets a different embedding shift, biasing all channel representations.
+
+Zero bias → numerically identical to vanilla BrainOmni (identity invariant).
+
+Critical init: final layer weights near-zero (std=1e-3) so training starts
+with near-zero bias, preserving BrainOmni's pre-trained representations.
 """
 
 from __future__ import annotations
@@ -14,54 +25,57 @@ import torch.nn as nn
 
 
 class MoERouterBias(nn.Module):
-    """Two-layer MLP mapping z_sulcal → per-expert router bias.
+    """Two-layer MLP: z_sulcal → channel embedding bias.
+
+    Output is broadcast over all channels and windows in BrainOmniWrapper.encode().
 
     Args:
         sulcal_dim:  Dimensionality of z_sulcal (default 256).
-        n_experts:   Must match BrainOmni's MoE n_experts exactly.
-                     Read from BrainOmni source before instantiating.
+        n_dim:       BrainOmni token dimension (n_dim before projection).
+                     Must match model.tokenizer.n_dim exactly.
         hidden_dim:  Hidden layer size (default 128).
         init_std:    Std for final layer init (default 1e-3).
-                     Keep small to preserve BrainOmni routing at init.
     """
 
     def __init__(
         self,
         sulcal_dim: int = 256,
-        n_experts: int | None = None,
+        n_dim: int | None = None,
         hidden_dim: int = 128,
         init_std: float = 1e-3,
     ):
         super().__init__()
-        if n_experts is None:
+        if n_dim is None:
             raise ValueError(
-                "n_experts must be set to match BrainOmni's MoE n_experts. "
-                "Read BrainOmni source to find this value."
+                "n_dim must match BrainOmni's tokenizer n_dim. "
+                "Read BrainOmni config (external/BrainOmni/share/) to find this value."
             )
-        self.n_experts = n_experts
+        self.n_dim = n_dim
 
         self.mlp = nn.Sequential(
             nn.Linear(sulcal_dim, hidden_dim),
             nn.GELU(),
-            nn.Linear(hidden_dim, n_experts),
+            nn.Linear(hidden_dim, n_dim),
         )
 
-        # Near-zero init on the final layer — critical for training stability
+        # Near-zero init on final layer — critical to preserve BrainOmni at training start
         nn.init.normal_(self.mlp[-1].weight, std=init_std)
         nn.init.zeros_(self.mlp[-1].bias)
 
     def forward(self, z_sulcal: torch.Tensor) -> torch.Tensor:
-        """Compute router bias from subject fingerprint.
+        """Compute channel embedding bias from subject fingerprint.
 
         Args:
             z_sulcal: (B, sulcal_dim)
 
         Returns:
-            bias: (B, n_experts) — added to MoE router logits before softmax
+            channel_bias: (B, 1, 1, n_dim)
+                Broadcast over C channels and W windows in BrainOmniWrapper.encode()
         """
-        return self.mlp(z_sulcal)
+        bias = self.mlp(z_sulcal)          # (B, n_dim)
+        return bias.unsqueeze(1).unsqueeze(1)  # (B, 1, 1, n_dim)
 
     def zero_(self) -> None:
-        """Zero all weights and biases (for testing zero-bias identity)."""
+        """Zero all weights and biases (for zero-bias identity test)."""
         for p in self.parameters():
             p.data.zero_()

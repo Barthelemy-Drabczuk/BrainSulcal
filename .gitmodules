@@ -1,0 +1,3 @@
+[submodule "external/BrainOmni"]
+	path = external/BrainOmni
+	url = https://github.com/OpenTSLab/BrainOmni

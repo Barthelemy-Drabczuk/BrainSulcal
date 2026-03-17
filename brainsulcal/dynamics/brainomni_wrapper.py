@@ -1,28 +1,32 @@
-"""Wraps BrainOmni with optional MoE router bias injection.
+"""Wraps BrainOmni with optional sulcal channel embedding bias injection.
 
-BrainOmni has two stages:
-  Stage 1 — BrainTokenizer: quantises raw EEG/MEG into discrete tokens
-  Stage 2 — BrainOmni backbone: transformer with Sparse MoE + DINT attention
+After studying BrainOmni source (external/BrainOmni/brainomni/model.py):
+  - Architecture: SpatialTemporalAttentionBlock (NOT MoE — no sparse router)
+  - Spatial attention operates over channels (B*W, C, D//2)
+  - Temporal attention operates over windows (B*C, W, D//2)
+  - encode() signature: (x, pos, sensor_type) → (B, C, W, D) L2-normalized
 
-All BrainOmni parameters are FROZEN. The only modification is adding a router
-bias to MoE router logits before softmax (surgical, minimal change).
+Injection point: the `neuro` per-channel embeddings.
+BrainOmni adds `self.tokenizer.encoder.neuros` (C, n_dim) to each token.
+We inject `channel_bias` (B, 1, 1, n_dim) as an additional subject-specific
+offset, added at the same point. This is minimal and surgical:
+  x = x + neuro + channel_bias  (zero channel_bias → identical to vanilla)
 
-NOTE: Before using this wrapper, study BrainOmni's source code to find:
-  1. The exact class/method where MoE router logits are computed
-  2. The value of n_experts
-  3. The expected montage_info format
+Input format:
+  x:           (B, C, W*T)  — EEG windows, C channels, W windows × T samples
+  pos:         (B, C, 6)    — electrode positions (xyz + orientation)
+  sensor_type: (B, C)       — sensor type integer codes
 
-Placeholder hooks are registered via forward hooks on the router modules.
-Update _find_router_modules() after studying BrainOmni internals.
+All BrainOmni parameters are FROZEN.
 """
 
 from __future__ import annotations
 
 import logging
-from typing import Any
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 logger = logging.getLogger(__name__)
 
@@ -30,11 +34,11 @@ _BRAINOMNI_CHECKPOINT = "OpenTSLab/BrainOmni"
 
 
 class BrainOmniWrapper(nn.Module):
-    """Frozen BrainOmni with optional sulcal router bias injection.
+    """Frozen BrainOmni with optional sulcal channel bias injection.
 
     Args:
-        checkpoint:  HuggingFace model ID or local path.
-        freeze:      If True (default), freeze all BrainOmni parameters.
+        checkpoint: HuggingFace model ID or local path to BrainOmni checkpoint.
+        freeze:     If True (default), freeze all BrainOmni parameters.
     """
 
     def __init__(
@@ -44,27 +48,23 @@ class BrainOmniWrapper(nn.Module):
     ):
         super().__init__()
         self.checkpoint = checkpoint
-        self._router_bias: torch.Tensor | None = None
-        self._hook_handles: list[Any] = []
-
         self.model = self._load_brainomni(checkpoint)
 
         if freeze:
             self._freeze()
 
-        # Register forward hooks for router bias injection
-        self._register_router_hooks()
-
     def _load_brainomni(self, checkpoint: str) -> nn.Module:
-        """Load BrainOmni from HuggingFace or local path.
-
-        NOTE: Implement once BrainOmni package is available via
-              `pixi run install-brainomni`.
-        """
         try:
-            # Import deferred — BrainOmni is an external submodule
-            from brain_omni import BrainOmni  # type: ignore[import]
-            model = BrainOmni.from_pretrained(checkpoint)
+            from brainomni.model import BrainOmni  # type: ignore[import]
+            import json
+            from huggingface_hub import hf_hub_download
+            cfg_path = hf_hub_download(checkpoint, "model_cfg.json")
+            ckpt_path = hf_hub_download(checkpoint, "BrainOmni.pt")
+            with open(cfg_path) as f:
+                cfg = json.load(f)
+            model = BrainOmni(**cfg)
+            state = torch.load(ckpt_path, map_location="cpu", weights_only=True)
+            model.load_state_dict(state)
             logger.info("Loaded BrainOmni from %s", checkpoint)
             return model
         except ImportError:
@@ -73,130 +73,137 @@ class BrainOmniWrapper(nn.Module):
                 "Using a stub for shape testing only."
             )
             return _BrainOmniStub()
+        except Exception as e:
+            logger.warning("BrainOmni load failed (%s) — using stub.", e)
+            return _BrainOmniStub()
 
     def _freeze(self) -> None:
-        """Freeze all BrainOmni parameters."""
         for p in self.model.parameters():
             p.requires_grad_(False)
-        logger.info("BrainOmni parameters frozen (%d params).", sum(1 for _ in self.model.parameters()))
+        n = sum(p.numel() for p in self.model.parameters())
+        logger.info("BrainOmni frozen (%d params).", n)
 
-    def _find_router_modules(self) -> list[nn.Module]:
-        """Return the MoE router modules inside BrainOmni.
+    @property
+    def n_dim(self) -> int:
+        """Tokenizer embedding dimension (= D in encode output)."""
+        try:
+            return self.model.tokenizer.n_dim
+        except AttributeError:
+            return 256  # BrainOmni base default
 
-        TODO: After studying BrainOmni source, replace this with the actual
-        module path. Example:
-            return [layer.moe.router for layer in self.model.backbone.layers
-                    if hasattr(layer, 'moe')]
-        """
-        routers = []
-        for name, module in self.model.named_modules():
-            # Heuristic: look for modules named 'router' or containing 'moe'
-            if "router" in name.lower() or type(module).__name__.lower() in ("moerouter", "sparserouter"):
-                routers.append(module)
-        if not routers:
-            logger.warning(
-                "No MoE router modules found in BrainOmni. "
-                "Router bias injection will have no effect. "
-                "Update _find_router_modules() after studying BrainOmni source."
-            )
-        return routers
+    @property
+    def lm_dim(self) -> int:
+        """Backbone hidden dimension (= D after projection)."""
+        try:
+            return self.model.lm_dim
+        except AttributeError:
+            return 512  # BrainOmni base default
 
-    def _register_router_hooks(self) -> None:
-        """Register forward hooks to inject router bias into MoE logits."""
-        # Remove any previously registered hooks
-        for h in self._hook_handles:
-            h.remove()
-        self._hook_handles.clear()
-
-        routers = self._find_router_modules()
-        for router in routers:
-            handle = router.register_forward_hook(self._router_bias_hook)
-            self._hook_handles.append(handle)
-
-        logger.debug("Registered router bias hooks on %d modules.", len(routers))
-
-    def _router_bias_hook(
+    def encode(
         self,
-        module: nn.Module,
-        inputs: tuple,
-        output: torch.Tensor,
+        x: torch.Tensor,
+        pos: torch.Tensor,
+        sensor_type: torch.Tensor,
+        channel_bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Add router bias to logits before softmax.
+        """Encode EEG with optional sulcal channel bias injection.
 
-        This hook fires AFTER the router linear layer but BEFORE softmax.
-        The output tensor is the router logits of shape (B, n_experts) or
-        (B*T, n_experts) depending on BrainOmni's implementation.
+        Replicates BrainOmni.encode() but injects channel_bias at the
+        neuro embedding step:
+            token += neuro_emb + channel_bias
 
-        TODO: Verify output shape after studying BrainOmni source.
+        Args:
+            x:            (B, C, W*T) — windowed EEG
+            pos:          (B, C, 6)   — electrode positions
+            sensor_type:  (B, C)      — sensor type codes
+            channel_bias: (B, 1, 1, lm_dim) or None
+                          Subject-specific bias over channel embeddings.
+                          Zero → identical to vanilla BrainOmni.
+
+        Returns:
+            features: (B, C, W, lm_dim) L2-normalized, same as BrainOmni.encode()
         """
-        if self._router_bias is None:
-            return output
+        model = self.model
 
-        bias = self._router_bias
-        if output.shape[-1] != bias.shape[-1]:
-            raise ValueError(
-                f"Router bias n_experts ({bias.shape[-1]}) does not match "
-                f"BrainOmni router output ({output.shape[-1]}). "
-                f"Update MoERouterBias(n_experts=...) to match BrainOmni."
-            )
+        # Handle stub
+        if isinstance(model, _BrainOmniStub):
+            return model.encode(x, pos, sensor_type, channel_bias)
 
-        # Broadcast bias over token dimension if needed
-        if output.dim() == 2 and bias.dim() == 2:
-            # output: (B*T, n_experts), bias: (B, n_experts)
-            # Need to know B and T — stored when forward() is called
-            if hasattr(self, "_batch_size") and output.shape[0] != bias.shape[0]:
-                B = self._batch_size
-                T = output.shape[0] // B
-                bias_expanded = bias.repeat_interleave(T, dim=0)  # (B*T, n_experts)
-                return output + bias_expanded
+        # --- Replicate BrainOmni.encode() with bias injection ---
+        x_tok, _ = model.tokenizer.tokenize(
+            x, pos, sensor_type, model.overlap_ratio
+        )
+        B, C, W, D = x_tok.shape
 
-        return output + bias
+        # Add neuro (per-channel positional) embeddings
+        neuro = model.tokenizer.encoder.neuros.type_as(x_tok).detach().view(1, C, 1, -1)
+        x_tok = x_tok + neuro
+
+        # Inject subject-specific channel bias (surgical, minimal modification)
+        if channel_bias is not None:
+            # channel_bias: (B, 1, 1, lm_dim) → broadcasts over C and W after projection
+            # Bias is injected before projection to match the neuro embedding scale
+            x_tok = x_tok + channel_bias
+
+        x_tok = model.projection(x_tok)  # (B, C, W, lm_dim)
+
+        # All blocks except last (matching BrainOmni.encode() exactly)
+        for block in model.blocks[:-1]:
+            x_tok = block(x_tok)
+
+        return F.normalize(x_tok, p=2.0, dim=-1, eps=1e-6)
 
     def forward(
         self,
-        eeg: torch.Tensor,
-        montage_info: dict,
-        router_bias: torch.Tensor | None = None,
+        x: torch.Tensor,
+        pos: torch.Tensor,
+        sensor_type: torch.Tensor,
+        channel_bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Run BrainOmni forward pass with optional router bias injection.
+        """Forward pass returning pooled (B, C*lm_dim) representation.
+
+        Matches BrainOmni downstream usage:
+            x = encode(...)          # (B, C, W, D)
+            x = x.mean(2)           # (B, C, D) — pool over windows
+            x = x.view(B, -1)       # (B, C*D) — flatten channels
 
         Args:
-            eeg:          (B, C, T) raw EEG signal
-            montage_info: dict with electrode positions, types, orientations
-            router_bias:  (B, n_experts) or None — sulcal router bias
+            x, pos, sensor_type: same as encode()
+            channel_bias: (B, 1, 1, n_dim) or None
 
         Returns:
-            token_repr: (B, n_tokens, d_model) BrainOmni token representations
+            (B, C*lm_dim) flattened representation
         """
-        self._router_bias = router_bias
-        self._batch_size = eeg.shape[0]
-
-        try:
-            output = self.model(eeg, montage_info=montage_info)
-        finally:
-            # Always clear the bias after forward to avoid stale state
-            self._router_bias = None
-
-        return output
-
-    @property
-    def d_model(self) -> int:
-        """BrainOmni hidden dimension (must match prefix_proj_dim in config)."""
-        try:
-            return self.model.config.d_model
-        except AttributeError:
-            return 512  # Default from CLAUDE.md; update after studying BrainOmni source
+        feat = self.encode(x, pos, sensor_type, channel_bias)  # (B, C, W, D)
+        feat = feat.mean(dim=2)                                  # (B, C, D)
+        return feat.contiguous().view(feat.shape[0], -1)         # (B, C*D)
 
 
 class _BrainOmniStub(nn.Module):
-    """Minimal stub for shape testing when BrainOmni is not installed."""
+    """Minimal stub for shape testing when BrainOmni is not installed.
 
-    def __init__(self):
+    Mimics BrainOmni base config:
+      n_dim=256, lm_dim=512, lm_depth=12, window compression ~4×
+    """
+
+    def __init__(self, n_dim: int = 256, lm_dim: int = 512, n_windows: int = 8):
         super().__init__()
-        self.config = type("Config", (), {"d_model": 512})()
+        self.n_dim = n_dim
+        self.lm_dim = lm_dim
+        self.n_windows = n_windows
 
-    def forward(self, eeg: torch.Tensor, **kwargs) -> torch.Tensor:
-        B, C, T = eeg.shape
-        n_tokens = T // 4  # Approximate tokenization ratio
-        d_model = self.config.d_model
-        return torch.zeros(B, n_tokens, d_model, device=eeg.device)
+    def encode(
+        self,
+        x: torch.Tensor,
+        pos: torch.Tensor,
+        sensor_type: torch.Tensor,
+        channel_bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        B, C, _ = x.shape
+        out = torch.zeros(B, C, self.n_windows, self.lm_dim, device=x.device)
+        return out
+
+    def forward(self, x, pos, sensor_type, channel_bias=None):
+        feat = self.encode(x, pos, sensor_type, channel_bias)
+        feat = feat.mean(dim=2)
+        return feat.contiguous().view(feat.shape[0], -1)
