@@ -18,6 +18,7 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
+from brainsulcal.data.montage_utils import channel_pos_sensor_type
 from brainsulcal.data.preprocessing import preprocess_eeg, epoch_music_segments
 from brainsulcal.priors.champollion_wrapper import ChampollionWrapper
 
@@ -55,8 +56,10 @@ class DalyMusicDataset(Dataset):
         self.cache_dir = Path(cache_dir) if cache_dir else None
         self.config = config or {}
 
-        # Loaded data: list of (eeg_tensor, label, subject_id)
-        self._items: list[tuple[torch.Tensor, torch.Tensor, str]] = []
+        # Loaded data: list of (eeg_tensor, label, subject_id, pos, sensor_type)
+        # pos: (C, 6) float32, sensor_type: (C,) int64 — or None if not available
+        self._items: list[tuple[torch.Tensor, torch.Tensor, str,
+                                torch.Tensor | None, torch.Tensor | None]] = []
         self._sulcal_cache: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
 
         self._load_all_subjects()
@@ -75,15 +78,20 @@ class DalyMusicDataset(Dataset):
                 emb, mask = self.champollion_wrapper.load_subject(subject_id)
                 self._sulcal_cache[subject_id] = (emb, mask)
 
-    def _load_subject(self, subject_id: str) -> list[tuple[torch.Tensor, torch.Tensor, str]]:
+    def _load_subject(self, subject_id: str) -> list[tuple]:
         # Try cache first
         if self.cache_dir is not None:
-            cache_path = self.cache_dir / f"{subject_id}_epochs.npy"
+            cache_path  = self.cache_dir / f"{subject_id}_epochs.npy"
             labels_path = self.cache_dir / f"{subject_id}_labels.npy"
+            ch_path     = self.cache_dir / f"{subject_id}_channels.txt"
             if cache_path.exists() and labels_path.exists():
-                eeg_np = np.load(cache_path)   # (n_epochs, n_channels, n_samples)
-                labels_np = np.load(labels_path)  # (n_epochs, 2)
-                return self._arrays_to_items(eeg_np, labels_np, subject_id)
+                eeg_np    = np.load(cache_path)     # (n_epochs, C, T)
+                labels_np = np.load(labels_path)    # (n_epochs, 2)
+                pos_t, st_t = None, None
+                if ch_path.exists():
+                    ch_names = ch_path.read_text().strip().splitlines()
+                    pos_t, st_t = _pos_from_ch_names(ch_names)
+                return self._arrays_to_items(eeg_np, labels_np, subject_id, pos_t, st_t)
 
         # Load and preprocess from raw BIDS data
         return self._preprocess_subject(subject_id)
@@ -123,13 +131,20 @@ class DalyMusicDataset(Dataset):
 
         eeg_np = epochs.get_data()  # (n_epochs, n_channels, n_samples)
 
+        # Extract pos / sensor_type from the preprocessed montage
+        ch_names = raw.info["ch_names"]
+        pos_t, st_t = channel_pos_sensor_type(raw.info)
+
         # Save to cache
         if self.cache_dir is not None:
             self.cache_dir.mkdir(parents=True, exist_ok=True)
             np.save(self.cache_dir / f"{subject_id}_epochs.npy", eeg_np)
             np.save(self.cache_dir / f"{subject_id}_labels.npy", labels_binary)
+            (self.cache_dir / f"{subject_id}_channels.txt").write_text(
+                "\n".join(ch_names)
+            )
 
-        return self._arrays_to_items(eeg_np, labels_binary, subject_id)
+        return self._arrays_to_items(eeg_np, labels_binary, subject_id, pos_t, st_t)
 
     def _load_events_and_labels(
         self, subject_id: str, raw: "mne.io.Raw"
@@ -165,30 +180,100 @@ class DalyMusicDataset(Dataset):
         eeg_np: "np.ndarray",
         labels_np: "np.ndarray",
         subject_id: str,
-    ) -> list[tuple[torch.Tensor, torch.Tensor, str]]:
+        pos: "torch.Tensor | None" = None,
+        sensor_type: "torch.Tensor | None" = None,
+    ) -> list[tuple]:
         items = []
         for i in range(len(eeg_np)):
-            eeg_t = torch.from_numpy(eeg_np[i]).float()
+            eeg_t   = torch.from_numpy(eeg_np[i]).float()
             label_t = torch.from_numpy(labels_np[i]).long()
-            items.append((eeg_t, label_t, subject_id))
+            items.append((eeg_t, label_t, subject_id, pos, sensor_type))
         return items
 
     def __len__(self) -> int:
         return len(self._items)
 
     def __getitem__(self, idx: int) -> dict:
-        eeg, labels, subject_id = self._items[idx]
 
-        item = {
+        eeg, labels, subject_id, pos, sensor_type = self._items[idx]
+
+        item: dict = {
             "eeg": eeg,                              # (C, T)
             "valence_label": labels[0],              # scalar int
             "arousal_label": labels[1],              # scalar int
             "subject_id": subject_id,
         }
 
+        if pos is not None:
+            item["pos"] = pos                        # (C, 6)
+            item["sensor_type"] = sensor_type        # (C,)
+
         if self.champollion_wrapper is not None and subject_id in self._sulcal_cache:
             emb, mask = self._sulcal_cache[subject_id]
-            item["sulcal_embeddings"] = emb    # (56, d)
-            item["sulcal_mask"] = mask         # (56,)
+            item["sulcal_embeddings"] = emb          # (56, d)
+            item["sulcal_mask"] = mask               # (56,)
 
         return item
+
+
+# ---------------------------------------------------------------------------
+# Module-level helpers
+# ---------------------------------------------------------------------------
+
+def _pos_from_ch_names(
+    ch_names: list[str],
+    montage_name: str = "standard_1020",
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute BrainOmni-compatible pos/sensor_type from a list of EEG channel names.
+
+    Creates a temporary MNE Info, sets the montage, then delegates to
+    montage_utils.channel_pos_sensor_type.
+
+    Args:
+        ch_names:     List of EEG channel names.
+        montage_name: MNE standard montage name.
+
+    Returns:
+        pos:         (C, 6) float32 tensor
+        sensor_type: (C,)   int64  tensor (all zeros for EEG)
+    """
+    import mne
+    info = mne.create_info(ch_names=ch_names, sfreq=250.0, ch_types="eeg", verbose=False)
+    montage = mne.channels.make_standard_montage(montage_name)
+    with mne.utils.use_log_level("ERROR"):
+        info.set_montage(montage, on_missing="ignore")
+    return channel_pos_sensor_type(info)
+
+
+def collate_fn(batch: list[dict]) -> dict:
+    """DataLoader collate function for DalyMusicDataset.
+
+    Stacks tensor fields and passes through string/optional fields.
+    Optional fields (pos, sensor_type, sulcal_embeddings, sulcal_mask)
+    are only included in the output if ALL items in the batch have them.
+
+    Args:
+        batch: List of dicts from DalyMusicDataset.__getitem__
+
+    Returns:
+        Batched dict with tensors stacked along dim=0.
+    """
+    out: dict = {}
+    keys = batch[0].keys()
+
+    for key in keys:
+        vals = [item[key] for item in batch]
+        if isinstance(vals[0], torch.Tensor):
+            out[key] = torch.stack(vals, dim=0)
+        elif isinstance(vals[0], str):
+            out[key] = vals  # keep as list of strings
+        # None values skipped (item without pos/sensor_type)
+
+    # Include optional tensor fields only when all items provide them
+    for opt_key in ("pos", "sensor_type", "sulcal_embeddings", "sulcal_mask"):
+        if opt_key not in keys:
+            vals = [item.get(opt_key) for item in batch]
+            if all(v is not None for v in vals):
+                out[opt_key] = torch.stack(vals, dim=0)
+
+    return out
