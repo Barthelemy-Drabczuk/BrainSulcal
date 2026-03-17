@@ -79,7 +79,9 @@ def test_batch_consistency(aggregator):
 
 
 def test_gradient_flows(aggregator):
-    """Gradients must flow through the aggregator."""
+    """Gradients must flow from input embeddings through the aggregator."""
+    aggregator.eval()  # disable dropout for deterministic gradient flow
+    torch.manual_seed(0)
     x = torch.randn(BATCH_SIZE, N_REGIONS, INPUT_DIM, requires_grad=True)
     z_sulcal, _ = aggregator(x)
     loss = z_sulcal.sum()
